@@ -65,15 +65,22 @@ def _build_cover_letter_prompt(profile: dict) -> str:
     all_banned = ", ".join(f'"{w}"' for w in BANNED_WORDS)
     leak_banned = ", ".join(f'"{p}"' for p in LLM_LEAK_PHRASES)
 
-    return f"""Write a cover letter for {sign_off_name}. The goal is to get an interview.
+    full_name = personal.get("full_name", sign_off_name)
+    sign_off_name = f"Sincerely,\n{full_name}"
 
-STRUCTURE: 3 short paragraphs. Under 250 words. Every sentence must earn its place.
+    return f"""Write a cover letter for {full_name}. The goal is to get an interview.
 
-PARAGRAPH 1 (2-3 sentences): Open with a specific thing YOU built that solves THEIR problem. Not "I'm excited about this role." Not "This role aligns with my experience." Start with the work.
+STRUCTURE: 4 paragraphs, 240-290 words in total (one page or slightly less). Succinct, clear, professional prose. Impressive but never boastful. It must read as sincere.
 
-PARAGRAPH 2 (3-4 sentences): Pick 2 achievements from the resume that are MOST relevant to THIS job. Use numbers. Frame as solving their problem, not listing your accomplishments.{projects_hint}{metrics_hint}
+PARAGRAPH 1 (introduction): State the exact role and company being applied to. Give the candidate's relevant background in one or two sentences (degree, years and type of experience) and their career goal. Say specifically why THIS role at THIS company interests them, using a real detail from the job description (the team's work, the business, the problem they solve).
 
-PARAGRAPH 3 (1-2 sentences): One specific thing about the company from the job description (a product, a technical challenge, a team structure). Then close. "Happy to walk through any of this in more detail." or "Let's discuss." Nothing else.
+PARAGRAPH 2 (overview of relevant experience): The 2-3 parts of the candidate's real experience most relevant to this job, stated factually with the real numbers from the resume.{projects_hint}{metrics_hint}
+
+PARAGRAPH 3 (main value add): A second strength that matters for this role (e.g. MBA coursework, AI/analytics projects, leadership, compliance). Do NOT point out gaps, missing requirements or things the candidate has not done; focus on transferable strengths and what they bring to this role. Stay truthful: never claim experience the candidate does not have.
+
+PARAGRAPH 4 (close): One or two sentences on what they would contribute, thanks, and an invitation to discuss. No clichés.
+
+FACTS: Use ONLY facts from the resume. Never invent responsibilities, outcomes, tools or numbers. The MBA was completed in September 2026 (never "candidate" or "will graduate"). AI project results are "simulated outputs demonstrated 60% task automation" (never a real-world reduction).
 
 BANNED WORDS AND PHRASES (automated validator rejects ANY of these — do not use even once):
 {all_banned}
@@ -84,20 +91,20 @@ ALSO BANNED (meta-commentary the validator catches):
 BANNED PUNCTUATION: No em dashes (—) or en dashes (–). Use commas or periods.
 
 VOICE:
-- Write like a real engineer emailing someone they respect. Not formal, not casual. Just direct.
+- Professional, warm and direct, written in the first person by the candidate.
+- Make the candidate as compelling as the facts allow: open with the strongest relevant fact (scale of team, prestigious clients, real numbers, the SMU MBA) and make the value to THIS employer obvious. Impressive through specifics, never through adjectives or exaggeration. Tone: confident but humble, never apologetic.
 - NEVER narrate or explain what you're doing. BAD: "This demonstrates my commitment to X." GOOD: Just state the fact and move on.
-- NEVER hedge. BAD: "might address some of your challenges." GOOD: "solves the same problem your team is facing."
-- Every sentence should contain either a number, a tool name, or a specific outcome. If it doesn't, cut it.
-- Read it out loud. If it sounds like a robot wrote it, rewrite it.
+- No exaggeration and no generic praise of the company; be specific and sincere.
 
 FABRICATION = INSTANT REJECTION:
 The candidate's real tools are ONLY: {skills_str}.
 Do NOT mention ANY tool not in this list. If the job asks for tools not listed, talk about the work you did, not the tools.
 
-Sign off: just "{sign_off_name}"
+Sign off exactly as:
+{sign_off_name}
 
 Output ONLY the letter text. No subject lines. No "Here is the cover letter:" preamble. No notes after the sign-off.
-Start DIRECTLY with "Dear Hiring Manager," and end with the name."""
+Start DIRECTLY with "Dear Hiring Team," (or "Dear <Name>," only if the posting names the hiring manager) and end with the name."""
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -248,8 +255,8 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
             # Generate PDF (best-effort)
             pdf_path = None
             try:
-                from applypilot.scoring.pdf import convert_to_pdf
-                pdf_path = str(convert_to_pdf(cl_path))
+                from applypilot.scoring.pdf import render_cover_letter_pdf
+                pdf_path = str(render_cover_letter_pdf(cl_path, profile.get("personal", {}), job["title"]))
             except Exception:
                 log.debug("PDF generation failed for %s", cl_path, exc_info=True)
 

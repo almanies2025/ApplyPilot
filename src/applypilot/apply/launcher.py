@@ -11,13 +11,14 @@ import logging
 import os
 import platform
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from rich.console import Console
@@ -63,24 +64,101 @@ if platform.system() != "Windows":
 # MCP config
 # ---------------------------------------------------------------------------
 
+def _open_outlook_tab(port: int) -> None:
+    """Keep the candidate's SMU Outlook open in its own tab for every job (the agent reads codes/links there, read-only)."""
+    import urllib.request
+
+    base = f"http://127.0.0.1:{port}"
+    try:
+        tabs = json.load(urllib.request.urlopen(base + "/json", timeout=15))
+        from applypilot.apply.outlook import is_outlook_url
+
+        if any(t.get("type") == "page" and (is_outlook_url(t.get("url", ""))
+                                            or "login.microsoftonline.com" in t.get("url", "")) for t in tabs):
+            return  # restored from the previous session
+        urllib.request.urlopen(urllib.request.Request(base + "/json/new?https://outlook.office.com/mail/", method="PUT"), timeout=15)
+    except Exception:
+        logger.debug("Could not open the Outlook tab", exc_info=True)
+
+
+def _cdp_alive(port: int) -> bool:
+    import urllib.request
+
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=8)
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_outlook(port: int) -> None:
+    """Re-sign in to the SMU mailbox if its session expired (password comes from the OUTLOOK_PASSWORD environment variable)."""
+    password = os.environ.get("OUTLOOK_PASSWORD")
+    if not password:
+        return
+    try:
+        from applypilot.apply import outlook
+
+        result = outlook.ensure_signed_in(port, config.load_profile()["personal"]["email"], password)
+        if result != "ok":
+            logger.info("Outlook mailbox: %s", result)
+            add_event(f"[W0] Outlook mailbox: {result}")
+    except Exception:
+        logger.debug("Outlook check failed", exc_info=True)
+
+
+def _scan_inbox(port: int) -> None:
+    """Between jobs: read the newest mail rows (read-only) and record confirmations, rejections, interview invites and action notices."""
+    try:
+        from applypilot.apply import inbox
+
+        new = inbox.scan(port)
+        if new:
+            add_event(f"[W0] Inbox: {len(new)} new application email(s)")
+    except Exception:
+        logger.debug("Inbox scan failed", exc_info=True)
+
+
+def _prune_tabs(port: int) -> None:
+    """After a job, close every tab except one Outlook tab so the saved Chrome session stays small and keeps the mail login."""
+    import urllib.request
+
+    base = f"http://127.0.0.1:{port}"
+    try:
+        pages = [t for t in json.load(urllib.request.urlopen(base + "/json", timeout=15)) if t.get("type") == "page"]
+        from applypilot.apply.outlook import is_outlook_url
+
+        keep = next((t for t in pages if is_outlook_url(t.get("url", ""))), None)
+        if keep is None:
+            return
+        for t in pages:
+            if t["id"] != keep["id"]:
+                urllib.request.urlopen(f"{base}/json/close/{t['id']}", timeout=10)
+    except Exception:
+        logger.debug("Could not prune tabs", exc_info=True)
+
+
+def _npx(args: list[str]) -> dict:
+    """MCP server entry running npx (Windows needs the cmd /c wrapper to launch npx.cmd)."""
+    if platform.system() == "Windows":
+        return {"command": "cmd", "args": ["/c", "npx", "-y", *args]}
+    return {"command": "npx", "args": ["-y", *args]}
+
+
 def _make_mcp_config(cdp_port: int) -> dict:
     """Build MCP config dict for a specific CDP port."""
-    return {
-        "mcpServers": {
-            "playwright": {
-                "command": "npx",
-                "args": [
-                    "@playwright/mcp@latest",
-                    f"--cdp-endpoint=http://localhost:{cdp_port}",
-                    f"--viewport-size={config.DEFAULTS['viewport']}",
-                ],
-            },
-            "gmail": {
-                "command": "npx",
-                "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
-            },
-        }
+    servers = {
+        "playwright": _npx([
+            "@playwright/mcp@latest",
+            # 127.0.0.1, not localhost: Node may resolve localhost to ::1, but Chrome listens on IPv4 only
+            f"--cdp-endpoint=http://127.0.0.1:{cdp_port}",
+            f"--viewport-size={config.DEFAULTS['viewport']}",
+        ]),
     }
+    # Gmail MCP only when its OAuth credentials have been set up (otherwise it blocks on auth)
+    if (Path.home() / ".gmail-mcp" / "credentials.json").exists():
+        servers["gmail"] = _npx(["@gongrzhe/server-gmail-autoauth-mcp"])
+    return {"mcpServers": servers}
 
 
 # ---------------------------------------------------------------------------
@@ -107,11 +185,11 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
             row = conn.execute("""
                 SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                       fit_score, location, full_description, cover_letter_path, apply_attempts, apply_error
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
                   AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
+                  AND (apply_status IS NULL OR apply_status != 'in_progress')
                 LIMIT 1
             """, (target_url, target_url, like, like)).fetchone()
         else:
@@ -129,7 +207,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 params.extend(blocked_patterns)
             row = conn.execute(f"""
                 SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                       fit_score, location, full_description, cover_letter_path, apply_attempts, apply_error
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
                   AND (apply_status IS NULL OR apply_status = 'failed')
@@ -323,13 +401,15 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     # Build claude command
     cmd = [
-        "claude",
+        shutil.which("claude") or "claude",  # resolves claude.CMD on Windows
         "--model", model,
         "-p",
         "--mcp-config", str(mcp_config_path),
         "--permission-mode", "bypassPermissions",
         "--no-session-persistence",
         "--disallowedTools", (
+            # The agent only needs the browser: no shell, no file edits on the user's machine
+            "Bash,PowerShell,Write,Edit,NotebookEdit,"
             "mcp__gmail__draft_email,mcp__gmail__modify_email,"
             "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
             "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
@@ -346,8 +426,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    env.pop("OUTLOOK_PASSWORD", None)  # the agent never sees the mailbox password
 
     worker_dir = reset_worker_dir(worker_id)
+
+    # Playwright MCP only uploads files from its working directory: stage the upload PDFs there
+    for upload in (config.APPLY_WORKER_DIR / "current").glob("*.pdf"):
+        if str(upload) in agent_prompt:
+            staged = worker_dir / upload.name
+            shutil.copy(upload, staged)
+            agent_prompt = agent_prompt.replace(str(upload), str(staged))
 
     update_state(worker_id, status="applying", job_title=job["title"],
                  company=job.get("site", ""), score=job.get("fit_score", 0),
@@ -383,6 +471,29 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         with _claude_lock:
             _claude_procs[worker_id] = proc
 
+        last_out = [time.time()]
+        recent_actions: list[str] = []
+
+        def _watchdog(p=proc):
+            """A stuck page must never block the whole queue. Kills the agent only on a real freeze: it runs past the total limit,
+            it goes silent, or it repeats the very same action many times in a row. Time spent on LinkedIn pages is NOT a reason."""
+            while p.poll() is None:
+                time.sleep(10)
+                now = time.time()
+                reason = None
+                if now - start > JOB_TIME_LIMIT_S:
+                    reason = f"exceeded {JOB_TIME_LIMIT_S}s"
+                elif now - last_out[0] > IDLE_LIMIT_S:
+                    reason = f"silent for {int(now - last_out[0])}s"
+                elif len(recent_actions) >= REPEAT_LIMIT and len(set(recent_actions[-REPEAT_LIMIT:])) == 1:
+                    reason = f"repeated the same action {REPEAT_LIMIT} times"
+                if reason:
+                    logger.warning("Killing the agent: %s", reason)
+                    subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
+                    return
+
+        threading.Thread(target=_watchdog, daemon=True).start()
+
         proc.stdin.write(agent_prompt)
         proc.stdin.close()
 
@@ -391,6 +502,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             lf.write(log_header)
 
             for line in proc.stdout:
+                last_out[0] = time.time()
                 line = line.strip()
                 if not line:
                     continue
@@ -422,6 +534,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     desc = name
 
                                 lf.write(f"  >> {desc}\n")
+                                recent_actions.append(desc)
+                                del recent_actions[:-20]
                                 ws = get_state(worker_id)
                                 cur_actions = ws.actions if ws else 0
                                 update_state(worker_id,
@@ -451,6 +565,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         output = "\n".join(text_parts)
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
+        _record_accounts(job, output)
+        _record_lessons(job, output)
+        _record_assumptions(job, output)
+        if "RESULT:" not in output and re.search(r"hit your .{0,24}limit", output, re.I):
+            add_event(f"[W{worker_id}] USAGE LIMIT: {output.strip()[:60]}")
+            _note_reset_time(output)
+            return "failed:usage_limit", duration_ms
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
@@ -519,6 +640,57 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 # Permanent failure classification
 # ---------------------------------------------------------------------------
 
+def _record_accounts(job: dict, output: str) -> None:
+    """Store passwords the agent reports ("ACCOUNT_PASSWORD: <site> | <email> | <password>") in the local vault."""
+    from applypilot.apply import vault
+
+    for m in re.finditer(r"ACCOUNT_PASSWORD:\s*([^|\n]+?)\s*\|\s*(\S+@\S+)\s*\|\s*([^\s`*]+)", output):
+        vault.save(job.get("site") or m.group(1), m.group(2), m.group(3).strip("`*\"'."))
+
+
+JOB_TIME_LIMIT_S = 12 * 60
+IDLE_LIMIT_S = 240
+REPEAT_LIMIT = 8
+
+
+def _note_reset_time(output: str) -> None:
+    """If the usage-limit message says when it resets ("resets 11:10am"), save that moment so the loop wakes up exactly then."""
+    m = re.search(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)", output, re.I)
+    if not m:
+        return
+    hour, minute, ampm = int(m.group(1)) % 12, int(m.group(2) or 0), m.group(3).lower()
+    hour += 12 if ampm == "pm" else 0
+    when = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if when < datetime.now():
+        when += timedelta(days=1)
+    (config.APP_DIR / "USAGE_RESET_AT").write_text(when.isoformat(), encoding="utf-8")
+
+
+def _record_assumptions(job: dict, output: str) -> None:
+    """Keep every 'ASSUMED: <field> = <answer>' the agent reports, so the candidate can review what was filled on their behalf."""
+    import time as _time
+
+    rows = re.findall(r"ASSUMED:\s*(.+)", output)
+    if rows:
+        with (config.APP_DIR / "assumptions.jsonl").open("a", encoding="utf-8") as fh:
+            for r in rows[:6]:
+                fh.write(json.dumps({"t": int(_time.time()), "job": job.get("title"), "site": job.get("site"), "assumed": r[:200]},
+                                    ensure_ascii=False) + "\n")
+
+
+def _record_lessons(job: dict, output: str) -> None:
+    """Keep the agent's LESSON lines, plus one automatic note per blocking outcome, for the next applications."""
+    from applypilot.apply import lessons
+
+    site = job.get("site") or ""
+    for m in list(re.finditer(r"LESSON(?:\[(general|site)\])?:\s*(.+)", output))[:3]:
+        # general tips (how forms, ATS platforms or bot checks behave) help every application; site tips only that employer
+        lessons.add("*" if m.group(1) == "general" else site, m.group(2))
+    m = re.search(r"RESULT:(?:FAILED:)?([A-Za-z_]+)", output)
+    if m and m.group(1) in ("CAPTCHA", "captcha", "stuck", "needs_code", "phone_code_needed", "login_issue"):
+        lessons.add("*", f"Applications ending in '{m.group(1)}' are common; if the same blocker appears early, stop and move on.", kind="auto")
+
+
 PERMANENT_FAILURES: set[str] = {
     "expired", "captcha", "login_issue",
     "not_eligible_location", "not_eligible_salary",
@@ -528,7 +700,10 @@ PERMANENT_FAILURES: set[str] = {
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
 }
 
-PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
+PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by",
+                                       "application_limit", "phone_code_needed", "needs_login", "needs_code",
+                                       "linkedin_signed_out", "assessment", "needs_info", "knockout", "suspicious",
+                                       "salary_below_minimum", "job_board_only")
 
 
 def _is_permanent_failure(result: str) -> bool:
@@ -539,6 +714,30 @@ def _is_permanent_failure(result: str) -> bool:
         or reason in PERMANENT_FAILURES
         or any(reason.startswith(p) for p in PERMANENT_PREFIXES)
     )
+
+
+_BOARDS = {"linkedin", "indeed", "glassdoor"}
+_EMPLOYER_GROUPS = [{"bytedance", "tiktok"}]  # employers sharing one application limit
+
+
+def _park_employer(job: dict, reason: str) -> None:
+    """The employer's site reported an application limit: park every other pending job at that employer."""
+    parts = reason.split(":", 2)  # application_limit:<employer>:<message>
+    employer = (job.get("site") or "").strip()
+    if employer.lower() in _BOARDS and len(parts) > 1:
+        employer = parts[1].strip()
+    if not employer:
+        return
+    names = {employer.lower()}
+    for group in _EMPLOYER_GROUPS:
+        if any(n in g or g in n for n in names for g in group):
+            names |= group
+    conn = get_connection()
+    for name in names:
+        conn.execute("""UPDATE jobs SET apply_status = 'skipped', apply_error = ?, apply_attempts = 99
+                        WHERE applied_at IS NULL AND apply_status IS NULL AND lower(site) LIKE ?""",
+                     (f"application limit reached at {employer}", f"%{name}%"))
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +768,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     jobs_done = 0
     empty_polls = 0
     port = BASE_CDP_PORT + worker_id
+    chrome_proc = None  # one Chrome is kept open across jobs so the mailbox login (a session cookie) survives
 
     while not _stop_event.is_set():
         if not continuous and jobs_done >= limit:
@@ -596,10 +796,15 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 
         empty_polls = 0
 
-        chrome_proc = None
         try:
-            add_event(f"[W{worker_id}] Launching Chrome...")
-            chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
+            if chrome_proc is None or chrome_proc.poll() is not None or not _cdp_alive(port):
+                if chrome_proc is not None:
+                    cleanup_worker(worker_id, chrome_proc)
+                add_event(f"[W{worker_id}] Launching Chrome...")
+                chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
+            _open_outlook_tab(port)
+            _ensure_outlook(port)
+            _scan_inbox(port)
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run)
@@ -608,6 +813,11 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 release_lock(job["url"])
                 add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
                 continue
+            elif result == "failed:usage_limit":
+                release_lock(job["url"])
+                (config.APP_DIR / "USAGE_LIMIT").write_text(datetime.now().isoformat(), encoding="utf-8")
+                add_event(f"[W{worker_id}] Claude usage limit reached: pausing the run")
+                break
             elif result == "applied":
                 mark_result(job["url"], "applied", duration_ms=duration_ms)
                 applied += 1
@@ -618,6 +828,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 mark_result(job["url"], "failed", reason,
                             permanent=_is_permanent_failure(result),
                             duration_ms=duration_ms)
+                if reason.startswith("application_limit"):
+                    _park_employer(job, reason)
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
@@ -636,12 +848,14 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             update_state(worker_id, jobs_failed=failed)
         finally:
             if chrome_proc:
-                cleanup_worker(worker_id, chrome_proc)
+                _prune_tabs(port)  # leave Chrome (and its mailbox login) running for the next job
 
         jobs_done += 1
         if target_url:
             break
 
+    if chrome_proc:
+        cleanup_worker(worker_id, chrome_proc)
     update_state(worker_id, status="done", last_action="finished")
     return applied, failed
 

@@ -5,6 +5,7 @@ and exports to PDF using headless Chromium via Playwright.
 """
 
 import logging
+import re
 from pathlib import Path
 
 from applypilot.config import TAILORED_DIR
@@ -148,6 +149,22 @@ def parse_entries(text: str) -> list[dict]:
 
 # ── HTML Template ────────────────────────────────────────────────────────
 
+def _edu_line_html(line: str) -> str:
+    """Lay out one education line: "Degree | Institution | Dates | Location" or "Label: text"."""
+    if " | " in line:
+        parts = [p.strip() for p in line.split(" | ")]
+        title, rest = parts[0], parts[1:]
+        dates = next((p for p in rest if re.search(r"\b(19|20)\d{2}\b", p)), "")
+        sub = " · ".join(p for p in rest if p != dates)
+        return (f'<div class="edu-entry"><div class="edu-row"><span class="edu-title">{title}</span>'
+                f'<span class="edu-date">{dates}</span></div>'
+                + (f'<div class="edu-sub">{sub}</div>' if sub else "") + "</div>")
+    if ":" in line:
+        label, text = line.split(":", 1)
+        return f'<div class="edu-note"><span class="skill-cat">{label}:</span>{text}</div>'
+    return f'<div class="edu">{line}</div>'
+
+
 def build_html(resume: dict) -> str:
     """Build professional resume HTML from parsed data.
 
@@ -161,12 +178,13 @@ def build_html(resume: dict) -> str:
 
     # Skills
     skills_html = ""
-    if "TECHNICAL SKILLS" in sections:
-        skills = parse_skills(sections["TECHNICAL SKILLS"])
+    skills_key = next((k for k in ("SKILLS", "TECHNICAL SKILLS") if k in sections), None)
+    if skills_key:
+        skills = parse_skills(sections[skills_key])
         rows = ""
         for cat, val in skills:
             rows += f'<div class="skill-row"><span class="skill-cat">{cat}:</span> {val}</div>\n'
-        skills_html = f'<div class="section"><div class="section-title">Technical Skills</div>{rows}</div>'
+        skills_html = f'<div class="section"><div class="section-title">Skills</div>{rows}</div>'
 
     # Experience
     exp_html = ""
@@ -193,8 +211,9 @@ def build_html(resume: dict) -> str:
     # Education
     edu_html = ""
     if "EDUCATION" in sections:
-        edu_text = sections["EDUCATION"].strip()
-        edu_html = f'<div class="section"><div class="section-title">Education</div><div class="edu">{edu_text}</div></div>'
+        edu_lines = "".join(_edu_line_html(line.strip())
+                            for line in sections["EDUCATION"].splitlines() if line.strip())
+        edu_html = f'<div class="section"><div class="section-title">Education</div>{edu_lines}</div>'
 
     # Summary
     summary_html = ""
@@ -215,8 +234,8 @@ def build_html(resume: dict) -> str:
 <meta charset="utf-8">
 <style>
 @page {{
-    size: letter;
-    margin: 0.35in 0.5in;
+    size: A4;
+    margin: 0.35in 0.45in;
 }}
 * {{
     margin: 0;
@@ -226,7 +245,7 @@ def build_html(resume: dict) -> str:
 body {{
     font-family: 'Calibri', 'Segoe UI', Arial, sans-serif;
     font-size: 10pt;
-    line-height: 1.35;
+    line-height: 1.3;
     color: #1a1a1a;
 }}
 .header {{
@@ -260,7 +279,10 @@ body {{
     text-decoration: none;
 }}
 .section {{
-    margin-top: 5px;
+    margin-top: 10px;
+}}
+.summary, .skill-row, li, .edu {{
+    text-align: justify;
 }}
 .section-title {{
     font-size: 10pt;
@@ -280,7 +302,7 @@ body {{
 .skill-row {{
     font-size: 9.5pt;
     margin: 0;
-    line-height: 1.35;
+    line-height: 1.3;
 }}
 .skill-cat {{
     font-weight: 600;
@@ -308,10 +330,39 @@ ul {{
 li {{
     font-size: 9.5pt;
     margin-bottom: 1px;
-    line-height: 1.35;
+    line-height: 1.3;
 }}
 .edu {{
-    font-size: 10pt;
+    font-size: 9.5pt;
+}}
+.edu-entry {{
+    margin-bottom: 3px;
+}}
+.edu-row {{
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+}}
+.edu-title {{
+    font-weight: 600;
+    font-size: 9.5pt;
+    color: #1a3a5c;
+}}
+.edu-date {{
+    font-size: 9pt;
+    font-style: italic;
+    color: #4a7a9b;
+    white-space: nowrap;
+}}
+.edu-sub {{
+    font-size: 9pt;
+    color: #444;
+}}
+.edu-note {{
+    font-size: 9pt;
+    margin: 0 0 4px 0;
+    text-align: justify;
 }}
 </style>
 </head>
@@ -333,12 +384,20 @@ li {{
 
 # ── PDF Renderer ─────────────────────────────────────────────────────────
 
-def render_pdf(html: str, output_path: str) -> None:
+FIT_SCALES = (1.0, 0.98, 0.96, 0.94, 0.92, 0.9)  # never shrink below 90% (keeps body text >= ~8.5pt)
+
+
+def _pdf_page_count(pdf_bytes: bytes) -> int:
+    return len(re.findall(rb"/Type\s*/Page(?!s)", pdf_bytes))
+
+
+def render_pdf(html: str, output_path: str, fit_one_page: bool = False) -> None:
     """Render HTML to PDF using Playwright's headless Chromium.
 
     Args:
         html: Complete HTML string.
         output_path: Path to write the PDF file.
+        fit_one_page: Scale down in small steps (to at most 90%) until the PDF fits on one page.
     """
     from playwright.sync_api import sync_playwright
 
@@ -346,16 +405,92 @@ def render_pdf(html: str, output_path: str) -> None:
         browser = p.chromium.launch()
         page = browser.new_page()
         page.set_content(html, wait_until="networkidle")
-        page.pdf(
-            path=output_path,
-            format="Letter",
-            margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
-            print_background=True,
-        )
+        for scale in FIT_SCALES if fit_one_page else (1.0,):
+            pdf_bytes = page.pdf(
+                format="A4",
+                margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
+                print_background=True,
+                scale=scale,
+            )
+            if _pdf_page_count(pdf_bytes) <= 1:
+                break
+        if fit_one_page and scale < 1.0:
+            log.info("Scaled to %.0f%% to fit one page: %s", scale * 100, output_path)
+        Path(output_path).write_bytes(pdf_bytes)
         browser.close()
 
 
+# ── Cover letter template ────────────────────────────────────────────────
+
+def build_letter_html(letter_text: str, personal: dict, re_line: str) -> str:
+    """One-page A4 letter: name/contact header, Re: line, justified paragraphs."""
+    import html as _html
+
+    blocks = [b.strip() for b in letter_text.strip().split("\n\n") if b.strip()]
+    salutation = blocks.pop(0) if blocks and blocks[0].lower().startswith("dear") else "Dear Hiring Manager,"
+    close = blocks.pop() if blocks and len(blocks[-1].split()) <= 6 else ""
+    linkedin = personal.get("linkedin_url", "").replace("https://www.", "").rstrip("/")
+    contact = " &nbsp;·&nbsp; ".join(_html.escape(p) for p in (
+        personal.get("phone", ""), personal.get("email", ""), linkedin, personal.get("city", "")) if p)
+    paras = "\n".join(f"<p>{_html.escape(b)}</p>" for b in blocks)
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+@page {{ size: A4; margin: 0; }}
+body {{ font-family: 'Times New Roman', Times, serif; font-size: 11.5pt; line-height: 1.42; color: #111;
+        margin: 0; padding: 0.85in 0.95in 0.7in 0.95in; }}
+.name {{ font-size: 18pt; font-weight: 700; letter-spacing: 1px; text-align: center; text-transform: uppercase; }}
+.contact {{ font-size: 10pt; color: #333; text-align: center; margin-top: 3px; padding-bottom: 8px; border-bottom: 0.8px solid #555; }}
+.re {{ margin-top: 22px; font-weight: 700; }}
+.salutation {{ margin-top: 14px; }}
+p {{ margin: 10px 0 0 0; text-align: justify; }}
+.close {{ margin-top: 16px; white-space: pre-line; }}
+</style></head><body>
+<div class="name">{_html.escape(personal.get("full_name", ""))}</div>
+<div class="contact">{contact}</div>
+<div class="re">Re: {_html.escape(re_line)}</div>
+<div class="salutation">{_html.escape(salutation)}</div>
+{paras}
+<div class="close">{_html.escape(close)}</div>
+</body></html>"""
+
+
+def render_cover_letter_pdf(text_path: Path, personal: dict, re_line: str) -> Path:
+    """Render a cover letter .txt to a one-page letter PDF next to it."""
+    text_path = Path(text_path)
+    out = text_path.with_suffix(".pdf")
+    render_pdf(build_letter_html(text_path.read_text(encoding="utf-8"), personal, re_line), str(out),
+               fit_one_page=True)
+    log.info("PDF generated: %s", out)
+    return out
+
+
 # ── Public API ───────────────────────────────────────────────────────────
+
+def _trim_one_bullet(text: str) -> str | None:
+    """Drop the single least-valuable bullet from a resume text (None if nothing can be trimmed).
+
+    Order: the last bullet of the longest PROJECTS entry (keeping at least 1), then the last bullet of the
+    longest EXPERIENCE entry (keeping at least 2). Bullets are ordered most-relevant-first, so the last goes first.
+    """
+    lines = text.split("\n")
+    section, runs = None, []  # runs: (section, [line indexes of one consecutive bullet run])
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s and s == s.upper() and not s.startswith("-") and len(s) > 3:
+            section = s
+        if line.startswith("- ") and section in ("PROJECTS", "EXPERIENCE"):
+            if runs and runs[-1][0] == section and runs[-1][1][-1] == i - 1:
+                runs[-1][1].append(i)
+            else:
+                runs.append((section, [i]))
+    for sec, keep in (("PROJECTS", 1), ("EXPERIENCE", 2)):
+        cands = [r for r in runs if r[0] == sec and len(r[1]) > keep]
+        if cands:
+            longest = max(len(r[1]) for r in cands)
+            pick = [r for r in cands if len(r[1]) == longest][-1]
+            del lines[pick[1][-1]]
+            return "\n".join(lines)
+    return None
+
 
 def convert_to_pdf(
     text_path: Path, output_path: Path | None = None, html_only: bool = False
@@ -385,7 +520,17 @@ def convert_to_pdf(
 
     out = output_path or text_path.with_suffix(".pdf")
     out = Path(out)
-    render_pdf(html, str(out))
+    for _ in range(8):
+        render_pdf(html, str(out), fit_one_page=True)
+        if _pdf_page_count(out.read_bytes()) <= 1:
+            break
+        trimmed = _trim_one_bullet(text)  # still 2 pages at the smallest allowed scale: drop the weakest bullet
+        if trimmed is None:
+            break
+        text = trimmed
+        text_path.write_text(text, encoding="utf-8")
+        html = build_html(parse_resume(text))
+        log.info("Trimmed one low-priority bullet to fit one page: %s", out.name)
     log.info("PDF generated: %s", out)
     return out
 

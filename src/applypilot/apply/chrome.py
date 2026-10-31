@@ -40,12 +40,23 @@ def _kill_process_tree(pid: int) -> None:
 
     try:
         if platform.system() == "Windows":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            )
+            import time as _time
+
+            # Close gracefully first so Chrome flushes cookies/sessions to disk (keeps the candidate's sign-ins)
+            subprocess.run(["taskkill", "/T", "/PID", str(pid)], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10)
+            for _ in range(16):
+                _time.sleep(0.5)
+                alive = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True).stdout
+                if str(pid) not in alive:
+                    break
+            else:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
         else:
             # Unix: kill entire process group
             import os
@@ -217,6 +228,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
         f"--user-data-dir={profile_dir}",
         "--profile-directory=Default",
         "--no-first-run",
+        "--restore-last-session",  # keeps session-only logins (e.g. the SMU Outlook mailbox) across the per-job Chrome restarts
         "--no-default-browser-check",
         "--window-size=1024,768",
         "--disable-session-crashed-bubble",

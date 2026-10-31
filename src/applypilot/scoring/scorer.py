@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 
 # ── Scoring Prompt ────────────────────────────────────────────────────────
 
-SCORE_PROMPT = """You are a job fit evaluator. Given a candidate's resume and a job description, score how well the candidate fits the role.
+SCORE_PROMPT = """You are a job fit evaluator. Given a candidate's resume and a job description, score the candidate's realistic chance of being shortlisted for an interview.
 
 SCORING CRITERIA:
 - 9-10: Perfect match. Candidate has direct experience in nearly all required skills and qualifications.
@@ -30,10 +30,13 @@ SCORING CRITERIA:
 - 1-2: Poor match. Completely different field or experience level.
 
 IMPORTANT FACTORS:
-- Weight technical skills heavily (programming languages, frameworks, tools)
-- Consider transferable experience (automation, scripting, API work)
-- Factor in the candidate's project experience
+- Judge the candidate's WHOLE background, not only work history: the MBA (finance track, digital transformation, marketing), the first degree, languages (native Arabic, fluent English), international exposure, the AI/technology projects, and 4 years of management and operations experience in Saudi Arabia
+- Judge the ACTUAL job from its description (duties, scope, requirements), never from the title alone. Executive, Associate, Analyst, Specialist, Consultant and Coordinator roles are as welcome as Manager roles when the duties suit an MBA graduate and the pay can support an Employment Pass (posted or likely pay of about SGD 6,000+ per month; if the description points to clerical, admin or support-level pay below that, score lower)
+- Prefer Executive / Associate / Analyst / Specialist / Consultant roles: a role that manages a team or P&L, or needs 5+ years, is a stretch for this candidate (about 1 year of people management); score it lower than an equally good individual-contributor role (MANAGER ROLES ARE A STRETCH, see the candidate constraints)
+- Weight the job's core requirements heavily (domain knowledge, functional experience, required skills and tools)
+- Consider transferable experience and the candidate's education and project work
 - Be realistic about experience level vs. job requirements (years of experience, seniority)
+- If CANDIDATE CONSTRAINTS are provided, apply them strictly; they override skill fit
 
 RESPOND IN EXACTLY THIS FORMAT (no other text):
 SCORE: [1-10]
@@ -70,12 +73,55 @@ def _parse_score_response(response: str) -> dict:
     return {"score": score, "keywords": keywords, "reasoning": reasoning}
 
 
-def score_job(resume_text: str, job: dict) -> dict:
+def _candidate_constraints(profile: dict) -> str:
+    """Format the profile's job_preferences (seniority + hard constraints) for the scoring prompt."""
+    prefs = profile.get("job_preferences", {})
+    lines = []
+    if prefs.get("seniority"):
+        lines.append(f"- Target seniority: {prefs['seniority']}")
+    lines.extend(f"- {c}" for c in prefs.get("constraints", []))
+    return "CANDIDATE CONSTRAINTS:\n" + "\n".join(lines) if lines else ""
+
+
+SALARY_CAP_SCORE = 4
+
+
+def _max_monthly_salary(salary: str | None) -> float | None:
+    """Best-effort parse of a posted salary into its maximum MONTHLY amount (None if unknown)."""
+    if not salary:
+        return None
+    nums = [float(n.replace(",", "")) for n in re.findall(r"\d[\d,]*(?:\.\d+)?", salary)]
+    nums = [n for n in nums if n >= 100]  # skip stray small numbers
+    if not nums:
+        return None
+    s = salary.lower()
+    top = max(nums)
+    if "month" in s:
+        return top
+    if any(k in s for k in ("year", "annual", "annum", "/yr", "p.a")):
+        return top / 12
+    if "hour" in s:
+        return top * 173
+    return top / 12 if top > 30000 else top
+
+
+def _apply_salary_floor(result: dict, job: dict, floor: float) -> dict:
+    """Cap the score when the posting's maximum pay is below the candidate's minimum monthly salary."""
+    top = _max_monthly_salary(job.get("salary"))
+    if floor and top is not None and top < floor and result["score"] > SALARY_CAP_SCORE:
+        result["score"] = SALARY_CAP_SCORE
+        result["reasoning"] += (f" [Capped at {SALARY_CAP_SCORE}: posted salary max ~{top:,.0f}/month"
+                                f" is below the candidate's minimum of {floor:,.0f}/month.]")
+    return result
+
+
+def score_job(resume_text: str, job: dict, constraints: str = "") -> dict:
     """Score a single job against the resume.
 
     Args:
         resume_text: The candidate's full resume text.
         job: Job dict with keys: title, site, location, full_description.
+        constraints: Optional CANDIDATE CONSTRAINTS block from _candidate_constraints().
 
     Returns:
         {"score": int, "keywords": str, "reasoning": str}
@@ -89,7 +135,9 @@ def score_job(resume_text: str, job: dict) -> dict:
 
     messages = [
         {"role": "system", "content": SCORE_PROMPT},
-        {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\nJOB POSTING:\n{job_text}"},
+        {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\n"
+                                    + (f"{constraints}\n\n---\n\n" if constraints else "")
+                                    + f"JOB POSTING:\n{job_text}"},
     ]
 
     try:
@@ -112,6 +160,9 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         {"scored": int, "errors": int, "elapsed": float, "distribution": list}
     """
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
+    profile = load_profile()
+    constraints = _candidate_constraints(profile)
+    salary_floor = float(profile.get("job_preferences", {}).get("min_monthly_salary") or 0)
     conn = get_connection()
 
     if rescore:
@@ -138,7 +189,7 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     results: list[dict] = []
 
     for job in jobs:
-        result = score_job(resume_text, job)
+        result = _apply_salary_floor(score_job(resume_text, job, constraints), job, salary_floor)
         result["url"] = job["url"]
         completed += 1
 
@@ -147,19 +198,18 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
 
         results.append(result)
 
+        # Save each score immediately so an interrupted run keeps its progress
+        conn.execute(
+            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+            (result["score"], f"{result['keywords']}\n{result['reasoning']}",
+             datetime.now(timezone.utc).isoformat(), result["url"]),
+        )
+        conn.commit()
+
         log.info(
             "[%d/%d] score=%d  %s",
             completed, len(jobs), result["score"], job.get("title", "?")[:60],
         )
-
-    # Write scores to DB
-    now = datetime.now(timezone.utc).isoformat()
-    for r in results:
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
-        )
-    conn.commit()
 
     elapsed = time.time() - t0
     log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)

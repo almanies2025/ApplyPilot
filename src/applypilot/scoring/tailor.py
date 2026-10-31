@@ -47,7 +47,7 @@ def _build_tailor_prompt(profile: dict) -> str:
     skills_lines = []
     for category, items in boundary.items():
         if isinstance(items, list) and items:
-            label = category.replace("_", " ").title()
+            label = category.replace("_and_", " & ").replace("_", " ").title()
             skills_lines.append(f"{label}: {', '.join(items)}")
     skills_block = "\n".join(skills_lines)
 
@@ -68,7 +68,12 @@ def _build_tailor_prompt(profile: dict) -> str:
     education = profile.get("experience", {})
     education_level = education.get("education_level", "")
 
-    return f"""You are a senior technical recruiter rewriting a resume to get this person an interview.
+    # Skills JSON keys mirror the profile's own skill categories
+    skill_labels = [c.replace("_and_", " & ").replace("_", " ").title()
+                    for c, items in boundary.items() if isinstance(items, list) and items]
+    skills_schema = ",".join(f'"{label}":"..."' for label in skill_labels) or '"Skills":"..."'
+
+    return f"""You are a senior recruiter rewriting a resume to get this person an interview.
 
 Take the base resume and job description. Return a tailored resume as a JSON object.
 
@@ -81,24 +86,30 @@ Take the base resume and job description. Return a tailored resume as a JSON obj
 ## SKILLS BOUNDARY (real skills only):
 {skills_block}
 
-You MAY add 2-3 closely related tools (Kubernetes if Docker, Terraform if AWS, Redis if PostgreSQL). No unrelated languages/frameworks.
+Use ONLY skills from this list, worded exactly as listed. Do NOT add any skill or tool that is not listed, even if the job asks for it.
 
 ## TAILORING RULES:
 
 TITLE: Match the target role. Keep seniority (Senior/Lead/Staff). Drop company suffixes and team names.
 
-SUMMARY: Rewrite from scratch. Lead with the 1-2 skills that matter most for THIS role. Sound like someone who's done this job.
+SUMMARY: Rewrite from scratch as a clear value proposition for THIS employer: 2-3 sentences stating who the candidate is and the specific value they bring to the employer's stated needs, backed by real experience and real numbers from the base resume. No generic claims.
 
-SKILLS: Reorder each category so the job's must-haves appear first.
+SKILLS: Use the categories in the output schema below. Reorder each category so the job's must-haves appear first; drop categories irrelevant to the job.
 
 Reframe EVERY bullet for this role. Same real work, different angle. Every bullet must be reworded. Never copy verbatim.
 
 PROJECTS: Reorder by relevance. Drop irrelevant projects entirely.
 
-BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, Designed, Implemented, Reduced, Automated, Deployed, Operated, Optimized). Most relevant first. Max 4 per section.
+BULLETS: Strong verb + what you did + quantified impact. Vary verbs (Led, Directed, Managed, Delivered, Oversaw, Built, Designed, Authored, Analysed). Most relevant first. Max 4 per section.
+
+IMPACT FRAMING (make the candidate as compelling as the facts allow):
+- Lead every summary and bullet with the most impressive TRUE fact relevant to this job: scale (40+ direct reports, 60+ seasonal hires, 100+ structured interviews), prestigious clients (Riyadh Municipality (Amanah), the National Water Company, the Saudi Ministry of Defence), and the SMU MBA (Singapore autonomous university, completed Sep 2026).
+- Present responsibility at its real scope: team size, client level, financial and compliance accountability, and cross-functional delivery, stated plainly.
+- Highlight the three MBA AI projects as hands-on technical credibility where relevant, always with "simulated outputs" for the 60% figure.
+- Use confident, active wording. Impress through facts, never adjectives. Do NOT invent or inflate numbers, titles, scope, outcomes, skills or tools, and do not claim results the base resume does not state.
 
 ## VOICE:
-- Write like a real engineer. Short, direct.
+- Write like a real professional in the target field. Short, direct.
 - GOOD: "Automated financial reporting with Python + API integrations, cut processing time from 10 hours to 2"
 - BAD: "Leveraged cutting-edge AI technologies to drive transformative operational efficiencies"
 - BANNED WORDS (using ANY of these = validation failure — do not use them even once):
@@ -107,6 +118,7 @@ BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, De
 
 ## HARD RULES:
 - Do NOT invent work, companies, degrees, or certifications
+- Do NOT add actions or outcomes that the base resume does not state (rewording is fine, new claims are not)
 - Do NOT change real numbers ({metrics_str})
 - Preserved companies: {companies_str} -- names stay as-is
 - Preserved school: {school}
@@ -114,7 +126,7 @@ BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, De
 
 ## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
 
-{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{school} | {education_level}"}}"""
+{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{{skills_schema}}},"experience":[{{"header":"Title at Company","subtitle":"Location | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Context | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{school} | {education_level}"}}"""
 
 
 def _build_judge_prompt(profile: dict) -> str:
@@ -165,9 +177,8 @@ ISSUES: (list any problems, or "none")
 
 ## TOLERANCE RULE:
 The goal is to get interviews, not to be a perfect fact-checker. Allow up to 3 minor stretches per resume:
-- Adding a closely related tool the candidate could realistically know is a MINOR STRETCH, not fabrication.
 - Reframing a metric with slightly different wording is a MINOR STRETCH.
-- Adding any LEARNABLE skill given their existing stack is a MINOR STRETCH.
+- Adding ANY skill or tool not in the allowed list is FABRICATION, not a stretch.
 - Only FAIL if there are MAJOR lies: completely invented projects, fake companies, fake degrees, wildly inflated numbers, or skills from a completely different domain.
 
 Be strict about major lies. Be lenient about minor stretches and learnable skills. Do not fail for style, tone, or restructuring."""
@@ -263,11 +274,19 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
     lines.append(sanitize_text(data["summary"]))
     lines.append("")
 
-    # Technical Skills
-    lines.append("TECHNICAL SKILLS")
+    # Skills -- only skills present in the profile's skills_boundary survive (no invented skills)
+    allowed = {s.lower().strip() for items in profile.get("skills_boundary", {}).values()
+               if isinstance(items, list) for s in items}
+    lines.append("SKILLS")
     if isinstance(data["skills"], dict):
         for cat, val in data["skills"].items():
-            lines.append(f"{cat}: {sanitize_text(str(val))}")
+            items = val if isinstance(val, (list, tuple)) else _split_skills(str(val))
+            kept = [str(s).strip() for s in items if not allowed or str(s).lower().strip() in allowed]
+            dropped = [str(s).strip() for s in items if str(s).strip() and str(s).strip() not in kept]
+            if dropped:
+                log.info("Dropped skills not in profile: %s", ", ".join(dropped))
+            if kept:
+                lines.append(f"{cat}: {sanitize_text(', '.join(kept))}")
     lines.append("")
 
     # Experience
@@ -290,11 +309,50 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
             lines.append(f"- {sanitize_text(b)}")
         lines.append("")
 
-    # Education
+    # Education -- copied verbatim from the base resume when available (degrees and dates are facts)
     lines.append("EDUCATION")
-    lines.append(sanitize_text(str(data.get("education", ""))))
+    base_edu = _base_education()
+    if base_edu:
+        lines.extend(sanitize_text(line) for line in base_edu)
+    else:
+        lines.append(sanitize_text(str(data.get("education", ""))))
 
     return "\n".join(lines)
+
+
+def _split_skills(text: str) -> list[str]:
+    """Split a comma-separated skills string, ignoring commas inside parentheses."""
+    parts, depth, cur = [], 0, ""
+    for ch in text:
+        depth += (ch == "(") - (ch == ")")
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _base_education() -> list[str]:
+    """Return the non-empty lines of the base resume's EDUCATION section ([] if not found)."""
+    try:
+        base = RESUME_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[str] = []
+    in_section = False
+    for line in base:
+        s = line.strip()
+        is_header = bool(s) and s == s.upper() and len(s) > 3 and not s.startswith("-")
+        if is_header:
+            if in_section:
+                break
+            in_section = s == "EDUCATION"
+            continue
+        if in_section and s:
+            out.append(s)
+    return out
 
 
 # ── LLM Judge ────────────────────────────────────────────────────────────

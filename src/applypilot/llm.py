@@ -2,7 +2,7 @@
 Unified LLM client for ApplyPilot.
 
 Auto-detects provider from environment:
-  GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)
+  GEMINI_API_KEY  -> Google Gemini (default: gemini-3.5-flash)
   OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
 
@@ -35,7 +35,7 @@ def _detect_provider() -> tuple[str, str, str]:
     if gemini_key and not local_url:
         return (
             "https://generativelanguage.googleapis.com/v1beta/openai",
-            model_override or "gemini-2.0-flash",
+            model_override or "gemini-3.5-flash",
             gemini_key,
         )
 
@@ -287,10 +287,68 @@ class _GeminiCompatForbidden(Exception):
 _instance: LLMClient | None = None
 
 
+class ClaudeCLIClient:
+    """LLM client backed by the local Claude Code CLI (`claude -p`), using the user's Claude login.
+
+    Enabled with LLM_PROVIDER=claude (LLM_MODEL picks the model, default "haiku").
+    Prompts go through stdin: on Windows `claude` is a .CMD shim, so long arguments would hit
+    cmd.exe's 8191-character limit.
+    """
+
+    _NO_TOOLS = ("Bash,PowerShell,Read,Write,Edit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,"
+                 "Task,Agent,TodoWrite")
+
+    def __init__(self, model: str) -> None:
+        import shutil
+        import tempfile
+
+        self.model = model
+        self.exe = shutil.which("claude") or "claude"
+        self.cwd = tempfile.mkdtemp(prefix="applypilot-llm-")
+
+    def chat(self, messages: list[dict], temperature: float = 0.0, max_tokens: int = 4096) -> str:
+        import subprocess
+
+        system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+        turns = [m for m in messages if m["role"] != "system"]
+        convo = "\n\n".join(
+            m["content"] if m["role"] == "user" else f"[Your previous reply]\n{m['content']}" for m in turns)
+        prompt = (f"INSTRUCTIONS:\n{system}\n\n---\n\n" if system else "") + convo + \
+            "\n\nRespond with ONLY the requested output, no commentary."
+        cmd = [self.exe, "-p", "--model", self.model, "--output-format", "text",
+               "--no-session-persistence", "--disallowedTools", self._NO_TOOLS]
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
+        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", timeout=_TIMEOUT * 3, cwd=self.cwd, env=env)
+                if r.returncode == 0 and r.stdout.strip():
+                    return r.stdout.strip()
+                log.warning("claude CLI failed (rc=%s): %s", r.returncode, (r.stderr or r.stdout)[:200])
+            except subprocess.TimeoutExpired:
+                log.warning("claude CLI timed out (attempt %d/%d)", attempt + 1, _MAX_RETRIES)
+            time.sleep(min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60))
+        raise RuntimeError("claude CLI request failed after all retries")
+
+    def ask(self, prompt: str, **kwargs) -> str:
+        return self.chat([{"role": "user", "content": prompt}], **kwargs)
+
+    def close(self) -> None:
+        pass
+
+
 def get_client() -> LLMClient:
     """Return (or create) the module-level LLMClient singleton."""
     global _instance
     if _instance is None:
+        if os.environ.get("LLM_PROVIDER", "").lower() == "claude":
+            model = os.environ.get("LLM_MODEL") or "haiku"
+            log.info("LLM provider: Claude Code CLI  model: %s", model)
+            _instance = ClaudeCLIClient(model)
+            return _instance
         base_url, model, api_key = _detect_provider()
         log.info("LLM provider: %s  model: %s", base_url, model)
         _instance = LLMClient(base_url, model, api_key)

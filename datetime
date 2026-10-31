@@ -1,0 +1,11 @@
+﻿python.exe :   File "<string>", line 3
+At line:6 char:1
++ & .\.venv\Scripts\python.exe -c "
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (  File "<string>", line 3:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    for r in get_connection().execute(" SELECT title,site,apply_status,apply_error FROM jobs WHERE last_attempted_at 
+now -8
+                                      ^
+SyntaxError: unterminated string literal (detected at line 3)
