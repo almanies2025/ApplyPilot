@@ -25,6 +25,35 @@ _TRANSIENT = re.compile(
     r"\d{1,2} (?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w* 20\d\d|retry (?:on )?a later day|later day)\b", re.I)
 
 
+_SUFFIX = re.compile(r"\b(pte|ltd|limited|inc|llc|llp|corp|corporation|co|company|singapore|sg|asia|apac|group|holdings|international|services)\b\.?", re.I)
+# A lesson must be a plain observation about a site: never a secret, an instruction aimed at the agent, or a way round the rules.
+_UNSAFE = re.compile(
+    r"(\b(ignore|disregard|override|forget|bypass)\b.{0,40}\b(rule|rules|instruction|instructions|guardrail|prompt|check|captcha)\b"
+    r"|system prompt|\bnew rule\b|\b(use|buy|rent|get)\b.{0,25}\bvirtual (phone )?number"
+    r"|\bwork ?around\b.{0,30}\b(captcha|bot|security)"
+    r"|\bpass(word|code)\b\s*(is|=|:)\s*\S+"
+    r"|@(mba\.)?smu\.edu\.sg|\bAH\d{4,}\b|\bpassport (no|number)\b\s*(is|=|:)?\s*[A-Z0-9]{6,})", re.I)
+# Absolute negatives ("can't be done", "no way in") describe one run, not the site: a later success must retire them
+_NEGATIVE = re.compile(r"\b(no way|never (?:becomes|became|loads?)|cannot|can't|impossible|not possible|always fails|will not|won't work)\b", re.I)
+N_GAP = 6 * 3600  # repeats of the same lesson inside this gap (retries of one job) count once
+
+
+def norm_site(site: str) -> str:
+    s = _SUFFIX.sub(" ", (site or "").lower())
+    s = re.sub(r"[^a-z0-9* ]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip() or (site or "").lower()
+
+
+def supersede_on_success(site: str) -> int:
+    """An application at this employer went through: drop its absolute-negative lessons (they were wrong or are now out of date)."""
+    key = norm_site(site)
+    rows = _rows()
+    keep = [r for r in rows if not (norm_site(r.get("site", "")) == key and key != "*" and _NEGATIVE.search(r.get("text", "")))]
+    if len(keep) != len(rows):
+        _write(keep)
+    return len(rows) - len(keep)
+
+
 def _clean(text: str) -> str:
     text = _URL.sub("", text or "").replace("\n", " ").strip(" -:|`*\"'")
     return re.sub(r"\s+", " ", text)[:220]
@@ -65,6 +94,10 @@ def compact() -> int:
     now = time.time()
     kept: list[dict] = []
     for r in sorted(_rows(), key=lambda x: x.get("t", 0)):
+        r["site"] = norm_site(r.get("site", ""))
+        r["n"] = min(r.get("n", 1), 5)
+        if _UNSAFE.search(r.get("text", "")):
+            continue
         if "exp" not in r and _TRANSIENT.search(r.get("text", "")):  # older lessons saved before expiry existed
             r["exp"] = int(r.get("t", now) + TRANSIENT_TTL)
         if not _alive(r, now):
@@ -85,14 +118,15 @@ def compact() -> int:
 
 def add(site: str, text: str, kind: str = "agent") -> None:
     text = _clean(text)
-    if len(text) < 12:
+    if len(text) < 12 or _UNSAFE.search(text):
         return
-    key = (site or "").lower()
+    key = norm_site(site)
     now = time.time()
     rows = _rows()
     for r in rows:
-        if r.get("site") == key and _similar(r.get("text", ""), text):  # the same lesson again: count it, refresh it
-            r["n"] = r.get("n", 1) + 1
+        if norm_site(r.get("site", "")) == key and _similar(r.get("text", ""), text):  # the same lesson again: count it, refresh it
+            if now - r.get("t", 0) > N_GAP:  # retries of one job are one observation, not several
+                r["n"] = r.get("n", 1) + 1
             r["t"] = int(now)
             if r.get("exp"):
                 r["exp"] = int(now + TRANSIENT_TTL)
@@ -121,5 +155,5 @@ def _best(rows: list[dict], limit: int) -> list[str]:
 def relevant(site: str, limit_site: int = 6, limit_general: int = 6) -> tuple[list[str], list[str]]:
     """(tips for this employer/site, general tips): live, distinct, most-confirmed first."""
     rows = _rows()
-    key = (site or "").lower()
-    return _best([r for r in rows if r["site"] == key], limit_site), _best([r for r in rows if r["site"] == "*"], limit_general)
+    key = norm_site(site)
+    return _best([r for r in rows if norm_site(r["site"]) == key], limit_site), _best([r for r in rows if r["site"] == "*"], limit_general)

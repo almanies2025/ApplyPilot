@@ -128,7 +128,8 @@ def _passes_filters(job: dict) -> bool:
 GUARDRAILS = """
 
 == FINAL GUARDRAILS (these override any conflicting text above) ==
-- Never use virtual phone numbers, and never solve or work around a CAPTCHA, image/slider puzzle or bot check: skip with RESULT:CAPTCHA (or RESULT:FAILED:phone_code_needed:<site>) and the run moves on; the candidate finishes those by hand.
+- Never use virtual phone numbers and never use a solver or any workaround for a security check.
+- CAPTCHA / BOT CHECK (user decision 2026-11-01): the candidate is at the computer and will solve it BY HAND within 3 minutes. Do NOT click, drag or type into the check yourself. When one appears: stop interacting with the page and alternate browser_wait_for (time 15) and browser_snapshot for up to 3 minutes (about 12 rounds) until the check is gone and the page has moved on; then continue the application where you left off. If it is still there after 3 minutes -> RESULT:CAPTCHA and move on.
 """
 
 
@@ -850,6 +851,11 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 break
             elif result == "applied":
                 mark_result(job["url"], "applied", duration_ms=duration_ms)
+                try:
+                    from applypilot.apply import lessons as _lessons
+                    _lessons.supersede_on_success(job.get("site") or "")
+                except Exception:
+                    logger.debug("lesson supersede failed", exc_info=True)
                 applied += 1
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
