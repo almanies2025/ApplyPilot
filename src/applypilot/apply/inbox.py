@@ -27,7 +27,7 @@ _JS = r"""(() => {
 
 _KINDS = [  # first match wins, strongest signal first
     ("rejection", re.compile(r"unfortunately|not (?:be )?moving forward|will not be proceeding|regret to inform|other candidates|not selected|unsuccessful|no longer under consideration", re.I)),
-    ("interview", re.compile(r"interview|invite you|schedule a (?:call|chat|time)|your availability|online (?:test|assessment)|hirevue|next steps|assessment", re.I)),
+    ("interview", re.compile(r"invite you to|would like to (?:schedule|invite|arrange|speak|meet)|schedule (?:a|an|your) (?:call|chat|interview|time)|please (?:book|select|choose|pick) a (?:time|slot)|share your availability|your availability|hirevue|online (?:test|assessment)|complete (?:an|the|your) assessment|interview (?:invitation|invite|slot|schedule)", re.I)),
     ("action needed", re.compile(r"further action|action (?:is )?required|complete your|additional question|update your application", re.I)),
     ("confirmation", re.compile(r"thank you for (?:applying|your application|your interest)|thanks for applying|application (?:has been )?(?:received|submitted)|received your application|we(?:'ve| have) received|successfully (?:submitted|applied)|your application (?:for|to|was)", re.I)),
 ]

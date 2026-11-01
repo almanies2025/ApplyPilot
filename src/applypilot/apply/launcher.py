@@ -107,6 +107,24 @@ def _ensure_outlook(port: int) -> None:
         logger.debug("Outlook check failed", exc_info=True)
 
 
+FILTER_SCRIPT = Path(os.environ.get(
+    "APPLYPILOT_FILTER_SCRIPT",
+    r"C:\Users\User\AppData\Local\Temp\claude\c--Users-User-Documents-GitHub-ApplyPilot\2072bc92-e321-4e78-abfc-d5094f3e6eff\scratchpad\enforce_caps.py"))
+
+
+def _passes_filters(job: dict) -> bool:
+    """Run the queue filters on the job just picked up (it is in_progress, so they can park it before any agent starts)."""
+    try:
+        if FILTER_SCRIPT.exists():
+            subprocess.run([sys.executable, str(FILTER_SCRIPT)], capture_output=True, timeout=45, cwd=str(FILTER_SCRIPT.parent))
+            row = get_connection().execute("SELECT apply_status FROM jobs WHERE url = ?", (job["url"],)).fetchone()
+            if row and row[0] == "skipped":
+                return False
+    except Exception:
+        logger.debug("Pre-flight filter check failed", exc_info=True)
+    return True
+
+
 def _scan_inbox(port: int) -> None:
     """Between jobs: read the newest mail rows (read-only) and record confirmations, rejections, interview invites and action notices."""
     try:
@@ -795,6 +813,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             continue
 
         empty_polls = 0
+
+        if not _passes_filters(job):  # duplicates, caps, government, managers, blocked employers: checked at pick-up time
+            add_event(f"[W{worker_id}] Skipped by filters: {job['title'][:40]}")
+            continue
 
         try:
             if chrome_proc is None or chrome_proc.poll() is not None or not _cdp_alive(port):
