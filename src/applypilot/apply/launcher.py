@@ -125,6 +125,13 @@ def _passes_filters(job: dict) -> bool:
     return True
 
 
+GUARDRAILS = """
+
+== FINAL GUARDRAILS (these override any conflicting text above) ==
+- Never use virtual phone numbers, and never solve or work around a CAPTCHA, image/slider puzzle or bot check: skip with RESULT:CAPTCHA (or RESULT:FAILED:phone_code_needed:<site>) and the run moves on; the candidate finishes those by hand.
+"""
+
+
 def _scan_inbox(port: int) -> None:
     """Between jobs: read the newest mail rows (read-only) and record confirmations, rejections, interview invites and action notices."""
     try:
@@ -412,6 +419,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         tailored_resume=resume_text,
         dry_run=dry_run,
     )
+    agent_prompt += GUARDRAILS
 
     # Write per-worker MCP config
     mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
