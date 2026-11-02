@@ -231,6 +231,12 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             if blocked_patterns:
                 url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
                 params.extend(blocked_patterns)
+            # Workers after the first have no LinkedIn / Indeed / Glassdoor sign-in, so they take employer-site jobs only.
+            board_clause = ""
+            if worker_id and worker_id > 0:
+                board_clause = " ".join(f"AND url NOT LIKE '%{b}%'" for b in ("linkedin.com", "indeed.com", "glassdoor.", "jobstreet."))
+            # Never run two applications at the same employer at once (shared mailbox codes, caps, duplicate risk).
+            busy_clause = "AND (site IS NULL OR site NOT IN (SELECT site FROM jobs WHERE apply_status = 'in_progress' AND site IS NOT NULL))"
             row = conn.execute(f"""
                 SELECT url, title, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path, apply_attempts, apply_error
@@ -241,6 +247,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                   AND fit_score >= ?
                   {site_clause}
                   {url_clauses}
+                  {board_clause}
+                  {busy_clause}
                 ORDER BY fit_score DESC, url
                 LIMIT 1
             """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()

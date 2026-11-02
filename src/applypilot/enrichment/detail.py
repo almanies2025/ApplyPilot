@@ -869,6 +869,19 @@ def run_enrichment(limit: int = 100, workers: int = 1) -> dict:
     Returns:
         Dict with stats: processed, ok, partial, error, tiers.
     """
+    # Only one enrichment pass at a time: several loops start it, and parallel passes (each driving Claude/browser work) overloaded the CPU
+    # and made the apply agents' browser tools time out. A second pass returns at once; the running one covers the queue.
+    import msvcrt
+    import os as _os
+
+    global _ENRICH_LOCK
+    _ENRICH_LOCK = open(_os.path.join(_os.path.expanduser("~"), ".applypilot", "enrich.lock"), "w")
+    try:
+        msvcrt.locking(_ENRICH_LOCK.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        logging.getLogger(__name__).info("another enrichment pass is already running; skipping")
+        return {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {}}
+
     conn = init_db()
 
     # URL resolution first

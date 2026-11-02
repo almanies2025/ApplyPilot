@@ -137,14 +137,42 @@ Read the job page. Determine the work arrangement. Then decide:
 Do NOT fill out forms for jobs that are clearly onsite in a non-acceptable location. Check EARLY, save time."""
 
 
-def _build_salary_section(profile: dict) -> str:
+_ENTRY_TITLE = re.compile(r"\b(graduate|trainee|junior|intern|entry|associate|analyst|executive|coordinator|specialist|officer|assistant|representative)\b", re.I)
+_SENIOR_TITLE = re.compile(r"\b(manager|senior|sr\.?|lead|principal|consultant|strategist|product|engineer|architect|scientist|controller|treasury|head)\b", re.I)
+_BIG_EMPLOYERS = re.compile(
+    r"\b(google|amazon|aws|meta|apple|microsoft|stripe|databricks|salesforce|grab|sea|shopee|bytedance|alibaba|tencent|visa|mastercard|jpmorgan|citi|hsbc|"
+    r"standard chartered|dbs|ocbc|uob|goldman|morgan stanley|blackrock|deloitte|pwc|kpmg|ey|mckinsey|bcg|bain|accenture|shell|bp|unilever|nestle|"
+    r"procter|siemens|bosch|abb|honeywell|schneider|maersk|dhl|kuehne|micron|amd|nvidia|samsung|merck|novartis|roche|pfizer|manulife|aia|prudential|"
+    r"allianz|axa|swiss re|marsh|aon|jll|cbre|cushman|singapore airlines|changi|keppel|seatrium|sembcorp|capitaland|wilmar|olam|cargill)\b", re.I)
+
+
+def _job_expected_monthly(job: dict | None) -> int:
+    """SGD 6,000 or 7,000 per month for this particular application (see patch note)."""
+    if not job:
+        return 7000
+    title = job.get("title") or ""
+    site = job.get("site") or ""
+    entry = bool(_ENTRY_TITLE.search(title))
+    senior = bool(_SENIOR_TITLE.search(title))
+    big = bool(_BIG_EMPLOYERS.search(site))
+    if re.search(r"\b(graduate|trainee|junior|intern|entry)\b", title, re.I):
+        return 6000
+    if senior and not (entry and not re.search(r"\b(manager|senior|lead|principal|head)\b", title, re.I)):
+        return 7000
+    if entry:
+        return 7000 if big and (job.get("fit_score") or 0) >= 7 else 6000
+    return 7000 if big else 6000
+
+
+def _build_salary_section(profile: dict, job: dict | None = None) -> str:
     """Build the salary negotiation instructions.
 
     Adapts floor, range, and currency from the profile's compensation section.
     """
     comp = profile["compensation"]
     currency = comp.get("salary_currency", "USD")
-    floor = comp["salary_expectation"]
+    expected = _job_expected_monthly(job)  # SGD 6,000 or 7,000 per month, different per application
+    floor = str(expected * 12)
     range_min = comp.get("salary_range_min", floor)
     range_max = comp.get("salary_range_max", str(int(floor) + 20000) if floor.isdigit() else floor)
     conversion_note = comp.get("currency_conversion_note", "")
@@ -164,10 +192,9 @@ def _build_salary_section(profile: dict) -> str:
     # Monthly figures derived from the annual standard figure (Singapore forms usually ask monthly pay)
     try:
         monthly = int(floor) // 12
-        monthly_high = int(round(monthly * 1.15 / 500.0) * 500)
-        range_answer = (f"low end = the standard figure for this employer type (e.g. monthly {monthly:,}), "
-                        f"high end about 15% above it (e.g. monthly {monthly_high:,} / annual {monthly_high * 12:,}); "
-                        f"the low end must never be below the floor")
+        monthly_high = monthly
+        range_answer = (f"answer exactly SGD 6,000 to {monthly:,} per month (annual 72,000 to {monthly * 12:,}); "
+                        f"the low end is SGD 6,000 and the high end is {monthly:,}, never anything outside that")
         target_text = f"{currency} {monthly:,} per month"
     except (ValueError, TypeError):
         range_answer = f'"${range_min}-${range_max} {currency}"'
@@ -180,10 +207,10 @@ def _build_salary_section(profile: dict) -> str:
         convert_line = "Posting is in a different currency? -> Target midpoint of their range. Convert if needed."
 
     return f"""== SALARY (think, don't just copy) ==
-The standard figure is ${floor} {currency} per year. The ABSOLUTE FLOOR is SGD 6,000 per month (the candidate's minimum); never go below it.
+For THIS application the expected salary is SGD {expected:,} per month ({currency} {floor} per year). The ABSOLUTE FLOOR is SGD 6,000 per month; use this figure for every salary answer on this application (it is SGD 6,000 or SGD 7,000 per month depending on the role and employer).
 
 Decision tree:
-1. Job posting shows a pay range? -> Answer in the UPPER THIRD of that range (about 70% of the way from its minimum to its maximum), never above the posted maximum and never below SGD 6,000 per month. If the upper third falls below SGD 8,000 but the posted maximum is 8,000 or more, answer SGD 8,000. If the posted maximum is below SGD 8,000 the role is not viable -> RESULT:FAILED:salary_below_minimum.
+1. Job posting shows a pay range? -> The expected salary is only ever SGD 7,000 or SGD 6,000 per month. If the posted range reaches SGD 7,000 per month or more, answer SGD 7,000. If its maximum is between SGD 6,000 and SGD 7,000, answer SGD 6,000. If the posted maximum is below SGD 6,000 the role is not viable -> RESULT:FAILED:salary_below_minimum.
 2. {convert_line}
 3. No posted range and a number is required? -> the standard figure for this employer type (see rule 2).
 4. A range is demanded? -> {range_answer}. Otherwise give ONE figure.
@@ -327,7 +354,7 @@ def build_prompt(job: dict, tailored_resume: str,
     except Exception:
         pass
     location_check = _build_location_check(profile, search_config)
-    salary_section = _build_salary_section(profile)
+    salary_section = _build_salary_section(profile, job)
     screening_section = _build_screening_section(profile)
     hard_rules = _build_hard_rules(profile)
 
