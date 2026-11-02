@@ -49,9 +49,15 @@ def _cdp_eval(ws_url: str, expr: str, timeout: float = 15):
         ws.close()
 
 
+_OPENER = re.compile(r"thank(?:s| you) for (?:applying|your application|submitting|creating an account)|application (?:has been )?(?:received|submitted)|received your application", re.I)
+
+
 def _classify(text: str) -> str | None:
     for kind, rx in _KINDS:
         if rx.search(text):
+            # An "invite you to ..." phrase in the boilerplate of a thank-you email is not an interview: needs the word in the subject area
+            if kind == "interview" and _OPENER.search(text[:220]) and not re.search(r"interview|hirevue|assessment|invitation", text[:220], re.I):
+                return "confirmation"
             return kind
     return None
 
