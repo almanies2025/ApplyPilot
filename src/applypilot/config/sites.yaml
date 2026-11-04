@@ -21,6 +21,9 @@ blocked:
     - "%google.jobs%"
     - "%accenture%"
     - "%workopolis.com/out%"
+    - "%.gov.sg%"
+    - "%careers.gov.sg%"
+    - "%psd.gov.sg%"
 
 # ── Blocked SSO domains — cannot authenticate through these ──────────────
 blocked_sso:

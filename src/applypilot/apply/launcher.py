@@ -203,6 +203,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     Returns:
         Job dict or None if the queue is empty.
     """
+    if (config.APP_DIR / "PAUSE_APPLY").exists():
+        return None  # user asked to pause applying; remove ~/.applypilot/PAUSE_APPLY to resume
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -229,8 +231,9 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 params.extend(blocked_sites)
             url_clauses = ""
             if blocked_patterns:
-                url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
-                params.extend(blocked_patterns)
+                url_clauses = " ".join("AND url NOT LIKE ? AND COALESCE(application_url, '') NOT LIKE ?" for _ in blocked_patterns)
+                for _pat in blocked_patterns:
+                    params.extend([_pat, _pat])
             # Workers after the first have no LinkedIn / Indeed / Glassdoor sign-in, so they take employer-site jobs only.
             board_clause = ""
             if worker_id and worker_id > 0:
