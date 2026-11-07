@@ -13,6 +13,7 @@ import platform
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -84,11 +85,16 @@ def _open_outlook_tab(port: int) -> None:
 def _cdp_alive(port: int) -> bool:
     import urllib.request
 
-    try:
-        urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=8)
-        return True
-    except Exception:
-        return False
+    # A busy machine (0.4-1.5 GB free RAM) answers slowly; one 8 s miss used to make the launcher kill a healthy Chrome
+    # (and its mailbox login) and relaunch it, which broke the running job's browser.
+    for attempt in range(3):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=15)
+            return True
+        except Exception:
+            if attempt < 2:
+                time.sleep(3)
+    return False
 
 
 def _ensure_outlook(port: int) -> None:
@@ -207,7 +213,16 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         return None  # user asked to pause applying; remove ~/.applypilot/PAUSE_APPLY to resume
     conn = get_connection()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        # Other loops (scoring, filters, maintenance) hold the DB write lock for long stretches; retry instead of
+        # crashing the whole apply run with "database is locked".
+        for _attempt in range(12):
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                break
+            except sqlite3.OperationalError as _e:
+                if "locked" not in str(_e).lower() or _attempt == 11:
+                    raise
+                time.sleep(5)
 
         if target_url:
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
@@ -287,10 +302,26 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         raise
 
 
+def _db_retry(fn, attempts: int = 12, delay: float = 5.0):
+    """Run a short DB write, retrying while other loops hold the write lock (a 'database is locked' used to kill the whole run)."""
+    for i in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower() or i == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
                 task_id: str | None = None) -> None:
     """Update a job's apply status in the database."""
+    _db_retry(lambda: _mark_result(url, status, error, permanent, duration_ms, task_id))
+
+
+def _mark_result(url: str, status: str, error: str | None, permanent: bool,
+                 duration_ms: int | None, task_id: str | None) -> None:
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     if status == "applied":
@@ -313,12 +344,14 @@ def mark_result(url: str, status: str, error: str | None = None,
 
 def release_lock(url: str) -> None:
     """Release the in_progress lock without changing status."""
-    conn = get_connection()
-    conn.execute(
-        "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ? AND apply_status = 'in_progress'",
-        (url,),
-    )
-    conn.commit()
+    def _do():
+        conn = get_connection()
+        conn.execute(
+            "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ? AND apply_status = 'in_progress'",
+            (url,),
+        )
+        conn.commit()
+    _db_retry(_do)
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +605,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     desc = name
 
                                 lf.write(f"  >> {desc}\n")
-                                recent_actions.append(desc)
+                                # compare the full input, not just the tool name: eight different browser_evaluate /
+                                # browser_snapshot calls in a row are normal work, not a loop
+                                recent_actions.append(desc + json.dumps(inp, sort_keys=True, default=str)[:400])
                                 del recent_actions[:-20]
                                 ws = get_state(worker_id)
                                 cur_actions = ws.actions if ws else 0
@@ -686,8 +721,8 @@ def _record_accounts(job: dict, output: str) -> None:
         vault.save(job.get("site") or m.group(1), m.group(2), m.group(3).strip("`*\"'."))
 
 
-JOB_TIME_LIMIT_S = 12 * 60
-IDLE_LIMIT_S = 240
+JOB_TIME_LIMIT_S = 18 * 60  # user 2026-11-07: give each attempt at least 15 minutes (was 12)
+IDLE_LIMIT_S = 420  # was 240: a slow page is not a freeze
 REPEAT_LIMIT = 8
 
 
@@ -815,8 +850,14 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         update_state(worker_id, status="idle", job_title="", company="",
                      last_action="waiting for job", actions=0)
 
-        job = acquire_job(target_url=target_url, min_score=min_score,
-                          worker_id=worker_id)
+        try:
+            job = acquire_job(target_url=target_url, min_score=min_score,
+                              worker_id=worker_id)
+        except sqlite3.OperationalError as e:  # DB locked by another loop: wait and retry instead of ending the run
+            logger.warning("Worker %d: acquire_job failed (%s); retrying", worker_id, e)
+            if _stop_event.wait(timeout=20):
+                break
+            continue
         if not job:
             if not continuous:
                 add_event(f"[W{worker_id}] Queue empty")
@@ -911,6 +952,26 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 # Main entry point (called from cli.py)
 # ---------------------------------------------------------------------------
 
+_instance_lock = None
+
+
+def _acquire_instance_lock() -> bool:
+    """Hold an OS file lock for the life of the process so two apply runs can never share the worker folders / Chrome ports."""
+    global _instance_lock
+    try:
+        import msvcrt
+        config.APP_DIR.mkdir(parents=True, exist_ok=True)
+        fh = open(config.APP_DIR / "apply.lock", "a+")
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        _instance_lock = fh
+        return True
+    except ImportError:
+        return True  # not Windows
+    except OSError:
+        return False
+
+
 def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
@@ -930,6 +991,9 @@ def main(limit: int = 1, target_url: str | None = None,
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
+    if not target_url and not _acquire_instance_lock():
+        print("Another apply run is already active; exiting (two runs share worker folders and Chrome).")
+        return
     _stop_event.clear()
 
     config.ensure_dirs()
