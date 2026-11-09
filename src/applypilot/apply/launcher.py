@@ -459,11 +459,23 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         resume_text = txt_path.read_text(encoding="utf-8")
 
     # Build the prompt
-    agent_prompt = prompt_mod.build_prompt(
-        job=job,
-        tailored_resume=resume_text,
-        dry_run=dry_run,
-    )
+    try:
+        agent_prompt = prompt_mod.build_prompt(
+            job=job,
+            tailored_resume=resume_text,
+            dry_run=dry_run,
+        )
+    except ValueError as e:
+        # A missing resume/cover file must never crash the whole run: clear the paths so the job is re-tailored, and move on
+        logger.warning("Job %s skipped, files missing: %s", job.get("title", "?"), e)
+        try:
+            conn = get_connection()
+            conn.execute("UPDATE jobs SET tailored_resume_path = NULL, tailored_at = NULL, tailor_attempts = 0, cover_letter_path = NULL, "
+                         "cover_letter_at = NULL, cover_attempts = 0, apply_status = NULL, agent_id = NULL WHERE url = ?", (job["url"],))
+            conn.commit()
+        except Exception:
+            pass
+        return "failed:resume_file_missing", 0
     agent_prompt += GUARDRAILS
 
     # Write per-worker MCP config

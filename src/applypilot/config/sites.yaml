@@ -22,6 +22,8 @@ blocked:
     - "%accenture%"
     - "%workopolis.com/out%"
     - "%.gov.sg%"
+    - "%jobs.lever.co%"
+    - "%lever.co/%"
     - "%careers.gov.sg%"
     - "%psd.gov.sg%"
 
