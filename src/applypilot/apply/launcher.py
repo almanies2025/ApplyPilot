@@ -267,7 +267,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                   {url_clauses}
                   {board_clause}
                   {busy_clause}
-                ORDER BY fit_score DESC, url
+                ORDER BY (url LIKE '%indeed.com%' OR url LIKE '%glassdoor%') ASC, (LOWER(title) LIKE '%executive%' OR LOWER(title) LIKE '%junior%' OR LOWER(title) LIKE '%entry%' OR LOWER(title) LIKE '%graduate%') DESC, date(discovered_at) DESC, fit_score DESC, url  -- newest postings first; LinkedIn and direct employer listings first (user, 2026-11-11)
                 LIMIT 1
             """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
 
