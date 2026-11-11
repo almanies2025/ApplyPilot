@@ -331,8 +331,11 @@ def _mark_result(url: str, status: str, error: str | None, permanent: bool,
                            apply_duration_ms = ?, apply_task_id = ?
             WHERE url = ?
         """, (now, duration_ms, task_id, url))
+    elif error and error.startswith("resume_file_missing"):
+        # not a site failure: the tailored files are gone, so the job goes back for re-tailoring (paths were already cleared)
+        conn.execute("UPDATE jobs SET apply_status = NULL, apply_error = NULL, apply_attempts = 0, agent_id = NULL WHERE url = ?", (url,))
     else:
-        attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
+        attempts = 99  # user rule (2026-11-10): any site that fails is never applied to again
         conn.execute(f"""
             UPDATE jobs SET apply_status = ?, apply_error = ?,
                            apply_attempts = {attempts}, agent_id = NULL,
