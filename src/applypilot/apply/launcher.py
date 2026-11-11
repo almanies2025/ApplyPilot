@@ -253,6 +253,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             board_clause = ""
             if worker_id and worker_id > 0:
                 board_clause = " ".join(f"AND url NOT LIKE '%{b}%'" for b in ("linkedin.com", "indeed.com", "glassdoor.", "jobstreet."))
+            # Jobs that hit LinkedIn's Easy Apply daily cap (no external route) are parked until tomorrow; others still run.
+            board_clause += f" AND COALESCE(apply_error, '') != 'easy_apply_limit:{datetime.now().strftime('%Y-%m-%d')}'"
             # Never run two applications at the same employer at once (shared mailbox codes, caps, duplicate risk).
             busy_clause = "AND (site IS NULL OR site NOT IN (SELECT site FROM jobs WHERE apply_status = 'in_progress' AND site IS NOT NULL))"
             row = conn.execute(f"""
@@ -331,6 +333,10 @@ def _mark_result(url: str, status: str, error: str | None, permanent: bool,
                            apply_duration_ms = ?, apply_task_id = ?
             WHERE url = ?
         """, (now, duration_ms, task_id, url))
+    elif error and error.startswith("easy_apply_limit"):
+        # LinkedIn daily Easy Apply cap: not the job's fault. Park it for today (retry tomorrow).
+        conn.execute("UPDATE jobs SET apply_status = NULL, apply_error = ?, apply_attempts = 0, agent_id = NULL WHERE url = ?",
+                     ("easy_apply_limit:" + datetime.now().strftime("%Y-%m-%d"), url))
     elif error and error.startswith("resume_file_missing"):
         # not a site failure: the tailored files are gone, so the job goes back for re-tailoring (paths were already cleared)
         conn.execute("UPDATE jobs SET apply_status = NULL, apply_error = NULL, apply_attempts = 0, agent_id = NULL WHERE url = ?", (url,))

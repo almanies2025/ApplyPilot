@@ -390,7 +390,7 @@ def build_prompt(job: dict, tailored_resume: str,
         "\"Easy Apply\" and the candidate is ALREADY signed in to LinkedIn in this browser, use it: untick \"Follow company\", "
         "deselect any saved resume and upload the tailored resume PDF, answer every question from the profile and resume, review "
         "the summary screen, then submit. Never sign in to LinkedIn and never create an account. Never message anyone, post, "
-        "connect, follow, change profile or settings, or set job alerts. LinkedIn Easy Apply is welcome and may take several minutes: keep going while the form advances. Only if a LinkedIn click or page does not respond after two tries, or the page looks identical after two snapshots, take the job's \"Apply on company website\" route if it has one, otherwise stop with RESULT:FAILED:stuck. If LinkedIn shows a sign-in screen or any verification "
+        "connect, follow, change profile or settings, or set job alerts. If LinkedIn says you reached today's Easy Apply limit, do NOT use Easy Apply: take the job's \"Apply on company website\" route if it has one, otherwise stop with RESULT:FAILED:easy_apply_limit. LinkedIn Easy Apply is welcome and may take several minutes: keep going while the form advances. Only if a LinkedIn click or page does not respond after two tries, or the page looks identical after two snapshots, take the job's \"Apply on company website\" route if it has one, otherwise stop with RESULT:FAILED:stuck. If LinkedIn shows a sign-in screen or any verification "
         "or security check -> RESULT:FAILED:linkedin_signed_out.")
     indeed_rule = (
         "Prefer \"Apply on company site\" and apply on the employer's own site. Use Indeed's own apply flow only if the candidate "
